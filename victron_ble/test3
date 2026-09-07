@@ -4,20 +4,19 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 
-// Your device MACs
+// MACs
 static const char* SHUNT_MAC = "c7:99:4b:5e:37:f5";
-static const char* DCDC_MAC = "f0:2e:2b:a8:5a:d6";   // TODO: fix to your real colon-format MAC
+static const char* DCDC_MAC  = "f0:2e:2b:a8:5a:d6";
 
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) override {
 
-    String mac = dev.getAddress().toString().c_str();
+    String mac = dev.getAddress().toString();
 
-    // Identify device type
     bool isShunt = mac.equalsIgnoreCase(SHUNT_MAC);
     bool isDCDC  = mac.equalsIgnoreCase(DCDC_MAC);
 
-    if (!isShunt && !isDCDC) return;  // ignore everything else
+    if (!isShunt && !isDCDC) return;
 
     Serial.println("======================================");
 
@@ -25,14 +24,10 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
     if (isDCDC)  Serial.println("DC/DC CONVERTER ADVERTISEMENT");
 
     Serial.printf("MAC: %s\n", mac.c_str());
-
-    if (dev.haveName()) {
-      Serial.printf("Name: %s\n", dev.getName().c_str());
-    } else {
-      Serial.println("Name: (none)");
-    }
-
     Serial.printf("RSSI: %d dBm\n", dev.getRSSI());
+
+    if (dev.haveName()) Serial.printf("Name: %s\n", dev.getName().c_str());
+    else Serial.println("Name: (none)");
 
     if (dev.haveManufacturerData()) {
       String md = dev.getManufacturerData();
@@ -41,8 +36,6 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
         Serial.printf("%02X ", (uint8_t)md[i]);
       }
       Serial.println();
-    } else {
-      Serial.println("Manufacturer Data: (none)");
     }
 
     Serial.println("======================================\n");
@@ -63,10 +56,14 @@ void setup() {
   scan->setInterval(100);
   scan->setWindow(99);
 
-  // Continuous scan
-  scan->start(0, false);
+  // ❌ DO NOT start scanning here
 }
 
 void loop() {
-  delay(1000);
+  BLEScan* scan = BLEDevice::getScan();
+
+  scan->start(5, false);   // scan for 5 seconds
+  scan->clearResults();    // clear old results
+
+  delay(200);              // keep loop stable
 }
