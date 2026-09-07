@@ -1,0 +1,72 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
+// Your device MACs
+static const char* SHUNT_MAC = "c7:99:4b:5e:37:f5";
+static const char* DCDC_MAC  = "f0:22:ba:85:ad:6e";   // update last byte if needed
+
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice dev) override {
+
+    String mac = dev.getAddress().toString().c_str();
+
+    // Identify device type
+    bool isShunt = mac.equalsIgnoreCase(SHUNT_MAC);
+    bool isDCDC  = mac.equalsIgnoreCase(DCDC_MAC);
+
+    if (!isShunt && !isDCDC) return;  // ignore everything else
+
+    Serial.println("======================================");
+
+    if (isShunt) Serial.println("SMARTSHUNT ADVERTISEMENT");
+    if (isDCDC)  Serial.println("DC/DC CONVERTER ADVERTISEMENT");
+
+    Serial.printf("MAC: %s\n", mac.c_str());
+
+    if (dev.haveName()) {
+      Serial.printf("Name: %s\n", dev.getName().c_str());
+    } else {
+      Serial.println("Name: (none)");
+    }
+
+    Serial.printf("RSSI: %d dBm\n", dev.getRSSI());
+
+    if (dev.haveManufacturerData()) {
+      String md = dev.getManufacturerData();
+      Serial.print("Manufacturer Data: ");
+      for (size_t i = 0; i < md.length(); i++) {
+        Serial.printf("%02X ", (uint8_t)md[i]);
+      }
+      Serial.println();
+    } else {
+      Serial.println("Manufacturer Data: (none)");
+    }
+
+    Serial.println("======================================\n");
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println("APP0: SmartShunt + DC/DC Advertisement Scanner Starting...");
+
+  BLEDevice::init("");
+
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(99);
+
+  // Continuous scan
+  scan->start(0, false);
+}
+
+void loop() {
+  delay(1000);
+}
