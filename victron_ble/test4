@@ -1,0 +1,132 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include "mbedtls/aes.h"
+
+// MACs of your devices
+static const char* SHUNT_MAC = "c7:99:4b:5e:37:f5";
+static const char* DCDC_MAC  = "f0:2e:2b:a8:5a:d6";
+
+// AES keys (from your screenshots)
+static const uint8_t DCDC_KEY[16] = {
+    0x2f,0x88,0x21,0xb6,0xc1,0x31,0xe7,0x6a,
+    0x1b,0x15,0x50,0x0a,0x3e,0x79,0x71,0x65
+};
+
+static const uint8_t SHUNT_KEY[16] = {
+    0xf9,0x00,0xf4,0x2f,0xc5,0x65,0x61,0xd5,
+    0x7a,0x05,0x4c,0xb2,0x94,0xbc,0x4b,0xf4
+};
+
+// AES‑CTR decrypt function
+void decryptRecord(const uint8_t* key, const uint8_t* md, size_t mdLen) {
+
+    if (mdLen < 6) {
+        Serial.println("Manufacturer data too short");
+        return;
+    }
+
+    // Build IV (nonce + zero counter)
+    // md[3] = nonce LSB
+    // md[4] = nonce MSB
+    uint8_t iv[16] = {0};
+    iv[0] = md[3];
+    iv[1] = md[4];
+
+    // Ciphertext starts at md[5]
+    const uint8_t* ct = md + 5;
+    size_t ctLen = mdLen - 5;
+
+    uint8_t pt[32] = {0};
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, key, 128);
+
+    size_t nc_off = 0;
+    uint8_t stream_block[16];
+
+    mbedtls_aes_crypt_ctr(&aes, ctLen, &nc_off, iv, stream_block, ct, pt);
+
+    Serial.print("PLAINTEXT: ");
+    for (int i = 0; i < ctLen; i++) {
+        Serial.printf("%02X ", pt[i]);
+    }
+    Serial.println();
+
+    mbedtls_aes_free(&aes);
+}
+
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice dev) override {
+
+    String mac = dev.getAddress().toString();
+
+    bool isShunt = mac.equalsIgnoreCase(SHUNT_MAC);
+    bool isDCDC  = mac.equalsIgnoreCase(DCDC_MAC);
+
+    if (!isShunt && !isDCDC) return;
+
+    Serial.println("======================================");
+
+    if (isShunt) Serial.println("SMARTSHUNT ADVERTISEMENT");
+    if (isDCDC)  Serial.println("DC/DC CONVERTER ADVERTISEMENT");
+
+    Serial.printf("MAC: %s\n", mac.c_str());
+    Serial.printf("RSSI: %d dBm\n", dev.getRSSI());
+
+    if (dev.haveName()) Serial.printf("Name: %s\n", dev.getName().c_str());
+    else Serial.println("Name: (none)");
+
+    if (!dev.haveManufacturerData()) {
+        Serial.println("Manufacturer Data: (none)");
+        Serial.println("======================================\n");
+        return;
+    }
+
+    String mdStr = dev.getManufacturerData();
+    const uint8_t* md = (const uint8_t*)mdStr.c_str();
+    size_t mdLen = mdStr.length();
+
+    Serial.print("Manufacturer Data: ");
+    for (size_t i = 0; i < mdLen; i++) {
+        Serial.printf("%02X ", md[i]);
+    }
+    Serial.println();
+
+    // Perform AES‑CTR decrypt
+    if (isDCDC) {
+        decryptRecord(DCDC_KEY, md, mdLen);
+    } else if (isShunt) {
+        decryptRecord(SHUNT_KEY, md, mdLen);
+    }
+
+    Serial.println("======================================\n");
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println("APP0: SmartShunt + DC/DC Advertisement Scanner Starting...");
+
+  BLEDevice::init("");
+
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(99);
+}
+
+void loop() {
+  BLEScan* scan = BLEDevice::getScan();
+
+  scan->start(5, false);   // scan for 5 seconds
+  scan->clearResults();    // clear old results
+
+  delay(200);
+}
