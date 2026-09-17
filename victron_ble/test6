@@ -1,0 +1,419 @@
+/*******************************************************
+ * ESP32 SmartShunt + DC/DC Split-Screen Dashboard
+ * 240x320 TFT_eSPI
+ *
+ * - Left side: SmartShunt info
+ * - Right side: DC/DC converter info
+ * - Top bar: Battery gauge + animated arrows
+ *
+ * NOTES:
+ * - This uses BLEDevice (ESP32 BLE lib) and mbedtls AES-CTR.
+ * - Display driver is TFT_eSPI; configure User_Setup.h
+ *   for your 240x320 panel and ESP32 pins.
+ *******************************************************/
+
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
+#include "mbedtls/aes.h"
+
+// ----------------------------------------------------
+// BLE MAC ADDRESSES (YOUR DEVICES)
+// ----------------------------------------------------
+static const char* SHUNT_MAC = "c7:99:4b:5e:37:f5";
+static const char* DCDC_MAC  = "f0:2e:2b:a8:5a:d6";
+
+// ----------------------------------------------------
+// AES KEYS (FROM YOUR SCREENSHOTS)
+// ----------------------------------------------------
+static const uint8_t DCDC_KEY[16] = {
+    0x2f,0x88,0x21,0xb6,0xc1,0x31,0xe7,0x6a,
+    0x1b,0x15,0x50,0x0a,0x3e,0x79,0x71,0x65
+};
+
+static const uint8_t SHUNT_KEY[16] = {
+    0xf9,0x00,0xf4,0x2f,0xc5,0x65,0x61,0xd5,
+    0x7a,0x05,0x4c,0xb2,0x94,0xbc,0x4b,0xf4
+};
+
+// ----------------------------------------------------
+// SIMPLE TELEMETRY STRUCTS (YOU CAN EXPAND LATER)
+// ----------------------------------------------------
+struct ShuntData {
+  bool   valid;
+  int    rssi;
+  float  voltage;   // V
+  float  current;   // A
+  float  soc;       // %
+};
+
+struct DcdcData {
+  bool   valid;
+  int    rssi;
+  float  inVoltage;   // V
+  float  outVoltage;  // V
+  float  outCurrent;  // A
+};
+
+ShuntData gShunt = {false, 0, 0.0f, 0.0f, 0.0f};
+DcdcData  gDcdc  = {false, 0, 0.0f, 0.0f, 0.0f};
+
+// ----------------------------------------------------
+// TFT DISPLAY (240x320) VIA TFT_eSPI
+// ----------------------------------------------------
+TFT_eSPI tft = TFT_eSPI();
+
+// For simple arrow animation
+uint8_t arrowPhase = 0;
+
+// ----------------------------------------------------
+// AES‑CTR DECRYPT (GENERIC RECORD DECRYPTOR)
+// ----------------------------------------------------
+void decryptRecord(const uint8_t* key, const uint8_t* md, size_t mdLen,
+                   bool isShunt)
+{
+  if (mdLen < 6) {
+    Serial.println("Manufacturer data too short");
+    return;
+  }
+
+  // Build IV (nonce + zero counter)
+  // md[3] = nonce LSB
+  // md[4] = nonce MSB
+  uint8_t iv[16] = {0};
+  iv[0] = md[3];
+  iv[1] = md[4];
+
+  // Ciphertext starts at md[5]
+  const uint8_t* ct = md + 5;
+  size_t ctLen = mdLen - 5;
+
+  uint8_t pt[64] = {0};  // adjust size if needed
+
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  mbedtls_aes_setkey_enc(&aes, key, 128);
+
+  size_t nc_off = 0;
+  uint8_t stream_block[16];
+
+  mbedtls_aes_crypt_ctr(&aes, ctLen, &nc_off, iv, stream_block, ct, pt);
+
+  mbedtls_aes_free(&aes);
+
+  // Debug: print plaintext bytes
+  Serial.print("PLAINTEXT: ");
+  for (size_t i = 0; i < ctLen; i++) {
+    Serial.printf("%02X ", pt[i]);
+  }
+  Serial.println();
+
+  // ----------------------------------------------------
+  // VERY SIMPLE PARSING STUB
+  // ----------------------------------------------------
+  // Here you map pt[] bytes to real fields.
+  // For now, we just fake some values so the UI moves.
+  // Replace this with your actual Victron frame parsing.
+  // ----------------------------------------------------
+  if (isShunt) {
+    gShunt.valid   = true;
+    gShunt.voltage = 12.5f;   // example
+    gShunt.current = -5.2f;   // negative = discharge
+    gShunt.soc     = 78.0f;   // %
+  } else {
+    gDcdc.valid      = true;
+    gDcdc.inVoltage  = 13.8f;
+    gDcdc.outVoltage = 14.4f;
+    gDcdc.outCurrent = 20.0f;
+  }
+}
+
+// ----------------------------------------------------
+// BLE CALLBACKS — UPDATE GLOBAL TELEMETRY
+// ----------------------------------------------------
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice dev) override {
+
+    String mac = dev.getAddress().toString();
+
+    bool isShunt = mac.equalsIgnoreCase(SHUNT_MAC);
+    bool isDCDC  = mac.equalsIgnoreCase(DCDC_MAC);
+
+    if (!isShunt && !isDCDC) return;
+
+    Serial.println("======================================");
+
+    if (isShunt) Serial.println("SMARTSHUNT ADVERTISEMENT");
+    if (isDCDC)  Serial.println("DC/DC CONVERTER ADVERTISEMENT");
+
+    Serial.printf("MAC: %s\n", mac.c_str());
+    Serial.printf("RSSI: %d dBm\n", dev.getRSSI());
+
+    if (dev.haveName()) Serial.printf("Name: %s\n", dev.getName().c_str());
+    else Serial.println("Name: (none)");
+
+    if (!dev.haveManufacturerData()) {
+      Serial.println("Manufacturer Data: (none)");
+      Serial.println("======================================\n");
+      return;
+    }
+
+    String mdStr = dev.getManufacturerData();
+    const uint8_t* md = (const uint8_t*)mdStr.c_str();
+    size_t mdLen = mdStr.length();
+
+    Serial.print("Manufacturer Data: ");
+    for (size_t i = 0; i < mdLen; i++) {
+      Serial.printf("%02X ", md[i]);
+    }
+    Serial.println();
+
+    // Store RSSI
+    if (isShunt) {
+      gShunt.rssi = dev.getRSSI();
+    } else {
+      gDcdc.rssi = dev.getRSSI();
+    }
+
+    // Perform AES‑CTR decrypt and update telemetry
+    if (isDCDC) {
+      decryptRecord(DCDC_KEY, md, mdLen, false);
+    } else if (isShunt) {
+      decryptRecord(SHUNT_KEY, md, mdLen, true);
+    }
+
+    Serial.println("======================================\n");
+  }
+};
+
+// ----------------------------------------------------
+// UI HELPERS — BATTERY GAUGE + ARROWS + PANELS
+// ----------------------------------------------------
+
+// Draw battery gauge at top center (approx)
+void drawBatteryGauge(float soc) {
+  // Gauge area: x=80..160, y=5..35
+  int x = 80;
+  int y = 5;
+  int w = 80;
+  int h = 25;
+
+  // Outline
+  tft.drawRect(x, y, w, h, TFT_WHITE);
+  // Battery "cap"
+  tft.fillRect(x + w, y + h/3, 6, h/3, TFT_WHITE);
+
+  // Fill based on SOC
+  if (soc < 0) soc = 0;
+  if (soc > 100) soc = 100;
+  int fillW = (int)((soc / 100.0f) * (w - 4));
+
+  uint16_t color = TFT_GREEN;
+  if (soc < 30) color = TFT_RED;
+  else if (soc < 60) color = TFT_YELLOW;
+
+  tft.fillRect(x + 2, y + 2, fillW, h - 4, color);
+
+  // Text SOC%
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(x + 10, y + h + 2);
+  tft.printf("SOC: %.0f%%", soc);
+}
+
+// Draw animated arrows indicating charge/discharge
+void drawArrows(float current) {
+  // Area near top left/right
+  // We'll draw 3 small arrows that "move" by phase.
+  int baseY = 10 + (arrowPhase % 5);  // simple vertical shift
+
+  // Decide direction: current > 0 = charging, < 0 = discharging
+  bool charging = (current > 0.5f);      // threshold
+  bool discharging = (current < -0.5f);  // threshold
+
+  // Clear area
+  tft.fillRect(5, 5, 70, 40, TFT_BLACK);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setCursor(10, 5);
+  if (charging)      tft.print("CHG");
+  else if (discharging) tft.print("DIS");
+  else               tft.print("IDLE");
+
+  // Arrow color
+  uint16_t arrowColor = charging ? TFT_GREEN : (discharging ? TFT_RED : TFT_DARKGREY);
+
+  // Draw 3 arrows horizontally
+  for (int i = 0; i < 3; i++) {
+    int ax = 10 + i * 18;
+    int ay = baseY + 10;
+
+    if (charging) {
+      // Right-pointing arrow
+      tft.drawLine(ax, ay, ax + 8, ay, arrowColor);
+      tft.drawLine(ax + 8, ay, ax + 4, ay - 4, arrowColor);
+      tft.drawLine(ax + 8, ay, ax + 4, ay + 4, arrowColor);
+    } else if (discharging) {
+      // Left-pointing arrow
+      tft.drawLine(ax + 8, ay, ax, ay, arrowColor);
+      tft.drawLine(ax, ay, ax + 4, ay - 4, arrowColor);
+      tft.drawLine(ax, ay, ax + 4, ay + 4, arrowColor);
+    } else {
+      // Small dot for idle
+      tft.fillCircle(ax + 4, ay, 2, arrowColor);
+    }
+  }
+}
+
+// Draw SmartShunt panel (left half)
+void drawSmartShuntPanel() {
+  int x = 0;
+  int y = 40;
+  int w = 120;
+  int h = 280;
+
+  // Panel border
+  tft.drawRect(x, y, w, h, TFT_BLUE);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setCursor(x + 5, y + 5);
+  tft.print("SmartShunt");
+
+  if (!gShunt.valid) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(x + 5, y + 20);
+    tft.print("No data");
+    return;
+  }
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+
+  int lineY = y + 25;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("RSSI: %d dBm", gShunt.rssi);
+
+  lineY += 12;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("Vbat: %.2f V", gShunt.voltage);
+
+  lineY += 12;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("Ibat: %.2f A", gShunt.current);
+
+  lineY += 12;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("SOC : %.1f %%", gShunt.soc);
+}
+
+// Draw DC/DC panel (right half)
+void drawDcdcPanel() {
+  int x = 120;
+  int y = 40;
+  int w = 120;
+  int h = 280;
+
+  // Panel border
+  tft.drawRect(x, y, w, h, TFT_MAGENTA);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setCursor(x + 5, y + 5);
+  tft.print("DC/DC");
+
+  if (!gDcdc.valid) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(x + 5, y + 20);
+    tft.print("No data");
+    return;
+  }
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+
+  int lineY = y + 25;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("RSSI: %d dBm", gDcdc.rssi);
+
+  lineY += 12;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("Vin : %.2f V", gDcdc.inVoltage);
+
+  lineY += 12;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("Vout: %.2f V", gDcdc.outVoltage);
+
+  lineY += 12;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("Iout: %.2f A", gDcdc.outCurrent);
+}
+
+// ----------------------------------------------------
+// REDRAW FULL DASHBOARD
+// ----------------------------------------------------
+void drawDashboard() {
+  // Clear full screen
+  tft.fillScreen(TFT_BLACK);
+
+  // Top bar: battery gauge + arrows
+  float soc = gShunt.valid ? gShunt.soc : 0.0f;
+  float current = gShunt.valid ? gShunt.current : 0.0f;
+
+  drawBatteryGauge(soc);
+  drawArrows(current);
+
+  // Split-screen panels
+  drawSmartShuntPanel();
+  drawDcdcPanel();
+}
+
+// ----------------------------------------------------
+// SETUP
+// ----------------------------------------------------
+void setup() {
+  Serial.begin(115200);   // Debug channel
+  delay(200);
+
+  Serial.println("APP0: SmartShunt + DC/DC Dashboard Starting...");
+
+  // Init TFT
+  tft.init();
+  tft.setRotation(1);     // 240x320 landscape (adjust if needed)
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(10, 10);
+  tft.print("Initializing BLE...");
+
+  // Init BLE
+  BLEDevice::init("");
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(99);
+
+  // Initial dashboard
+  drawDashboard();
+}
+
+// ----------------------------------------------------
+// LOOP
+// ----------------------------------------------------
+void loop() {
+  BLEScan* scan = BLEDevice::getScan();
+
+  // Scan for 5 seconds
+  scan->start(5, false);
+  scan->clearResults();
+
+  // Advance arrow animation phase
+  arrowPhase++;
+
+  // Redraw dashboard with latest telemetry
+  drawDashboard();
+
+  // Small delay to avoid hammering display
+  delay(300);
+}
