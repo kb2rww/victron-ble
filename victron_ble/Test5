@@ -1,0 +1,203 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include "mbedtls/aes.h"
+#include <TFT_eSPI.h>
+
+// -------------------------------
+// DISPLAY SETUP
+// -------------------------------
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite left = TFT_eSprite(&tft);
+TFT_eSprite right = TFT_eSprite(&tft);
+
+// -------------------------------
+// DEVICE MAC ADDRESSES
+// -------------------------------
+static const char* SHUNT_MAC = "c7:99:4b:5e:37:f5";
+static const char* DCDC_MAC  = "f0:2e:2b:a8:5a:d6";
+
+// -------------------------------
+// AES KEYS
+// -------------------------------
+static const uint8_t DCDC_KEY[16] = {
+    0x2f,0x88,0x21,0xb6,0xc1,0x31,0xe7,0x6a,
+    0x1b,0x15,0x50,0x0a,0x3e,0x79,0x71,0x65
+};
+
+static const uint8_t SHUNT_KEY[16] = {
+    0xf9,0x00,0xf4,0x2f,0xc5,0x65,0x61,0xd5,
+    0x7a,0x05,0x4c,0xb2,0x94,0xbc,0x4b,0xf4
+};
+
+// -------------------------------
+// LIVE VALUES
+// -------------------------------
+float shuntVoltage = 0;
+float shuntCurrent = 0;
+float shuntPower   = 0;
+String shuntState  = "—";
+
+float dcdcInVolt   = 0;
+float dcdcOutVolt  = 0;
+float dcdcOutCurr  = 0;
+float dcdcOutPower = 0;
+String dcdcState   = "—";
+
+// -------------------------------
+// AES CTR DECRYPT
+// -------------------------------
+void decryptRecord(const uint8_t* key, const uint8_t* md, size_t mdLen, bool isShunt) {
+
+    if (mdLen < 6) return;
+
+    uint8_t iv[16] = {0};
+    iv[0] = md[3];
+    iv[1] = md[4];
+
+    const uint8_t* ct = md + 5;
+    size_t ctLen = mdLen - 5;
+
+    uint8_t pt[64] = {0};
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, key, 128);
+
+    size_t nc_off = 0;
+    uint8_t stream_block[16];
+
+    mbedtls_aes_crypt_ctr(&aes, ctLen, &nc_off, iv, stream_block, ct, pt);
+    mbedtls_aes_free(&aes);
+
+    // -------------------------------
+    // PARSE SMARTSHUNT
+    // -------------------------------
+    if (isShunt) {
+        shuntVoltage = (pt[0] | (pt[1] << 8)) / 100.0;
+        shuntCurrent = (pt[2] | (pt[3] << 8)) / 100.0;
+        shuntPower   = shuntVoltage * shuntCurrent;
+        shuntState   = "OK";
+    }
+
+    // -------------------------------
+    // PARSE DC/DC
+    // -------------------------------
+    else {
+        dcdcInVolt   = (pt[0] | (pt[1] << 8)) / 100.0;
+        dcdcOutVolt  = (pt[2] | (pt[3] << 8)) / 100.0;
+        dcdcOutCurr  = (pt[4] | (pt[5] << 8)) / 100.0;
+        dcdcOutPower = dcdcOutVolt * dcdcOutCurr;
+        dcdcState    = "Active";
+    }
+}
+
+// -------------------------------
+// DRAW DASHBOARD (240×320)
+// -------------------------------
+void drawDashboard() {
+
+    left.fillSprite(TFT_BLACK);
+    right.fillSprite(TFT_BLACK);
+
+    // LEFT PANEL — SMARTSHUNT
+    left.setTextColor(TFT_CYAN, TFT_BLACK);
+    left.drawString("SMARTSHUNT", 10, 10, 2);
+
+    left.setTextColor(TFT_WHITE, TFT_BLACK);
+    left.drawString("Voltage:", 10, 40, 2);
+    left.drawFloat(shuntVoltage, 2, 100, 40, 2);
+
+    left.drawString("Current:", 10, 70, 2);
+    left.drawFloat(shuntCurrent, 2, 100, 70, 2);
+
+    left.drawString("Power:", 10, 100, 2);
+    left.drawFloat(shuntPower, 2, 100, 100, 2);
+
+    left.drawString("State:", 10, 130, 2);
+    left.drawString(shuntState, 100, 130, 2);
+
+    // RIGHT PANEL — DC/DC
+    right.setTextColor(TFT_YELLOW, TFT_BLACK);
+    right.drawString("DC/DC", 10, 10, 2);
+
+    right.setTextColor(TFT_WHITE, TFT_BLACK);
+    right.drawString("In Volt:", 10, 40, 2);
+    right.drawFloat(dcdcInVolt, 2, 100, 40, 2);
+
+    right.drawString("Out Volt:", 10, 70, 2);
+    right.drawFloat(dcdcOutVolt, 2, 100, 70, 2);
+
+    right.drawString("Out Curr:", 10, 100, 2);
+    right.drawFloat(dcdcOutCurr, 2, 100, 100, 2);
+
+    right.drawString("State:", 10, 130, 2);
+    right.drawString(dcdcState, 100, 130, 2);
+
+    // Push sprites to screen
+    left.pushSprite(0, 0);
+    right.pushSprite(160, 0);
+}
+
+// -------------------------------
+// BLE CALLBACK
+// -------------------------------
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice dev) override {
+
+    String mac = dev.getAddress().toString();
+
+    bool isShunt = mac.equalsIgnoreCase(SHUNT_MAC);
+    bool isDCDC  = mac.equalsIgnoreCase(DCDC_MAC);
+
+    if (!isShunt && !isDCDC) return;
+
+    if (!dev.haveManufacturerData()) return;
+
+    String mdStr = dev.getManufacturerData();
+    const uint8_t* md = (const uint8_t*)mdStr.c_str();
+    size_t mdLen = mdStr.length();
+
+    if (isShunt) decryptRecord(SHUNT_KEY, md, mdLen, true);
+    else         decryptRecord(DCDC_KEY, md, mdLen, false);
+
+    drawDashboard();
+  }
+};
+
+// -------------------------------
+// SETUP
+// -------------------------------
+void setup() {
+    Serial.begin(115200);
+    delay(200);
+
+    tft.begin();
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
+
+    left.createSprite(160, 240);
+    right.createSprite(160, 240);
+
+    BLEDevice::init("");
+
+    BLEScan* scan = BLEDevice::getScan();
+    scan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    scan->setActiveScan(true);
+    scan->setInterval(100);
+    scan->setWindow(99);
+
+    drawDashboard();
+}
+
+// -------------------------------
+// LOOP
+// -------------------------------
+void loop() {
+    BLEScan* scan = BLEDevice::getScan();
+    scan->start(5, false);
+    scan->clearResults();
+    delay(200);
+}
