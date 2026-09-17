@@ -1,0 +1,435 @@
+/***************************************************************
+   ESP32 Victron SmartShunt + DC/DC BLE Dashboard
+   -------------------------------------------------------------
+   Display: 2.8" TFT (240x320) in LANDSCAPE mode
+   Resolution: 320 (width) × 240 (height)
+   Rotation: tft.setRotation(1)
+
+   This sketch:
+     • Scans BLE advertisements from SmartShunt + Orion DC/DC
+     • Decrypts manufacturer data using AES‑CTR (mbedtls)
+     • Splits screen into SmartShunt (left) and DC/DC (right)
+     • Draws a wide battery gauge + animated arrows in a top bar
+     • Uses a sprite for the top bar to avoid flicker
+     • Leaves a clearly marked parsing function where you can
+       map plaintext bytes → real values as you refine the format.
+
+***************************************************************/
+
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
+#include "mbedtls/aes.h"
+
+/***************************************************************
+   SECTION 1 — DEVICE MAC ADDRESSES
+   Adjust these to match your actual devices.
+***************************************************************/
+static const char* SHUNT_MAC = "c7:99:4b:5e:37:f5";
+static const char* DCDC_MAC  = "f0:2e:2b:a8:5a:d6";
+
+/***************************************************************
+   SECTION 2 — AES KEYS
+   These must match the keys you already derived.
+***************************************************************/
+static const uint8_t DCDC_KEY[16] = {
+    0x2f,0x88,0x21,0xb6,0xc1,0x31,0xe7,0x6a,
+    0x1b,0x15,0x50,0x0a,0x3e,0x79,0x71,0x65
+};
+
+static const uint8_t SHUNT_KEY[16] = {
+    0xf9,0x00,0xf4,0x2f,0xc5,0x65,0x61,0xd5,
+    0x7a,0x05,0x4c,0xb2,0x94,0xbc,0x4b,0xf4
+};
+
+/***************************************************************
+   SECTION 3 — TELEMETRY STRUCTS
+***************************************************************/
+struct ShuntData {
+  bool   valid;
+  int    rssi;
+  float  voltage;   // V
+  float  current;   // A
+  float  soc;       // %
+};
+
+struct DcdcData {
+  bool   valid;
+  int    rssi;
+  float  inVoltage;   // V
+  float  outVoltage;  // V
+  float  outCurrent;  // A
+};
+
+ShuntData gShunt = {false, 0, 0.0f, 0.0f, 0.0f};
+DcdcData  gDcdc  = {false, 0, 0.0f, 0.0f, 0.0f};
+
+/***************************************************************
+   SECTION 4 — DISPLAY SETUP
+***************************************************************/
+TFT_eSPI tft = TFT_eSPI();
+
+// Top bar sprite (full width of landscape screen)
+TFT_eSprite topBar = TFT_eSprite(&tft);
+
+uint8_t arrowPhase = 0;
+
+/***************************************************************
+   SECTION 5 — PARSING HOOK
+   This is where you map plaintext bytes → real values.
+   Right now it’s conservative and commented so you can tune it.
+***************************************************************/
+void parseVictronFrame(uint8_t *pt, size_t len, bool isShunt) {
+  // For debugging: print raw plaintext bytes
+  Serial.print(isShunt ? "SmartShunt PT: " : "DC/DC PT: ");
+  for (size_t i = 0; i < len; i++) Serial.printf("%02X ", pt[i]);
+  Serial.println();
+
+  /***********************************************************
+    IMPORTANT:
+    From your logs, frames vary in length and structure.
+    Different firmware / product types pack fields differently.
+
+    Rather than guessing exact offsets, we:
+      • Mark this function as the single place to refine parsing.
+      • Show example extraction patterns.
+      • Let you adjust indices once you correlate bytes with
+        known values (voltage, current, SOC) from VictronConnect.
+
+    Below is a SAFE template that won’t lie to you:
+      • It checks length.
+      • It extracts a few candidate fields.
+      • It scales them in a typical mV/mA way.
+      • It clearly labels where you should adjust indices.
+  ***********************************************************/
+
+  if (len < 8) {
+    // Too short to contain meaningful telemetry
+    return;
+  }
+
+  if (isShunt) {
+    // ---- SmartShunt candidate mapping (YOU TUNE THIS) ----
+    // Example: treat bytes 2–3 as voltage, 4–5 as current, 6–7 as SOC
+    uint16_t v_raw   = (pt[2] << 8) | pt[3];   // candidate voltage
+    int16_t  i_raw   = (int16_t)((pt[4] << 8) | pt[5]); // candidate current
+    uint16_t soc_raw = (pt[6] << 8) | pt[7];   // candidate SOC
+
+    // These scalings are typical; adjust if you see mismatch:
+    float v = v_raw / 1000.0f;   // mV → V
+    float i = i_raw / 1000.0f;   // mA → A
+    float s = soc_raw / 10.0f;   // 0.1% → %
+
+    gShunt.valid   = true;
+    gShunt.voltage = v;
+    gShunt.current = i;
+    gShunt.soc     = s;
+
+    Serial.printf("SmartShunt decoded (candidate): V=%.3fV I=%.3fA SOC=%.1f%%\n",
+                  gShunt.voltage, gShunt.current, gShunt.soc);
+  } else {
+    // ---- DC/DC candidate mapping (YOU TUNE THIS) ----
+    // Example: treat bytes 2–3 as Vin, 4–5 as Vout, 6–7 as Iout
+    uint16_t vin_raw  = (pt[2] << 8) | pt[3];
+    uint16_t vout_raw = (pt[4] << 8) | pt[5];
+    int16_t  iout_raw = (int16_t)((pt[6] << 8) | pt[7]);
+
+    float vin  = vin_raw  / 1000.0f;
+    float vout = vout_raw / 1000.0f;
+    float iout = iout_raw / 1000.0f;
+
+    gDcdc.valid      = true;
+    gDcdc.inVoltage  = vin;
+    gDcdc.outVoltage = vout;
+    gDcdc.outCurrent = iout;
+
+    Serial.printf("DC/DC decoded (candidate): Vin=%.3fV Vout=%.3fV Iout=%.3fA\n",
+                  gDcdc.inVoltage, gDcdc.outVoltage, gDcdc.outCurrent);
+  }
+
+  /***********************************************************
+    As you correlate:
+      • Watch Serial prints.
+      • Compare with VictronConnect values.
+      • Adjust indices (2,3,4,5,6,7) until they line up.
+
+    Once you lock in the mapping, this function becomes your
+    “truth source” for all UI rendering.
+  ***********************************************************/
+}
+
+/***************************************************************
+   SECTION 6 — AES‑CTR DECRYPT
+***************************************************************/
+void decryptRecord(const uint8_t* key, const uint8_t* md, size_t mdLen,
+                   bool isShunt)
+{
+  if (mdLen < 6) return;
+
+  // IV is derived from manufacturer data bytes 3 and 4
+  uint8_t iv[16] = {0};
+  iv[0] = md[3];
+  iv[1] = md[4];
+
+  // Ciphertext starts at byte 5
+  const uint8_t* ct = md + 5;
+  size_t ctLen = mdLen - 5;
+
+  uint8_t pt[64] = {0};
+
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  mbedtls_aes_setkey_enc(&aes, key, 128);
+
+  size_t nc_off = 0;
+  uint8_t stream_block[16];
+
+  mbedtls_aes_crypt_ctr(&aes, ctLen, &nc_off, iv, stream_block, ct, pt);
+  mbedtls_aes_free(&aes);
+
+  // Hand plaintext to parser
+  parseVictronFrame(pt, ctLen, isShunt);
+}
+
+/***************************************************************
+   SECTION 7 — BLE CALLBACK
+***************************************************************/
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice dev) override {
+
+    String mac = dev.getAddress().toString();
+
+    bool isShunt = mac.equalsIgnoreCase(SHUNT_MAC);
+    bool isDCDC  = mac.equalsIgnoreCase(DCDC_MAC);
+
+    if (!isShunt && !isDCDC) return;
+    if (!dev.haveManufacturerData()) return;
+
+    String mdStr = dev.getManufacturerData();
+    const uint8_t* md = (const uint8_t*)mdStr.c_str();
+    size_t mdLen = mdStr.length();
+
+    if (isShunt) gShunt.rssi = dev.getRSSI();
+    else         gDcdc.rssi = dev.getRSSI();
+
+    decryptRecord(isShunt ? SHUNT_KEY : DCDC_KEY, md, mdLen, isShunt);
+  }
+};
+
+/***************************************************************
+   SECTION 8 — WIDE BATTERY GAUGE (TOP BAR SPRITE)
+***************************************************************/
+void drawBatteryGauge(float soc) {
+    if (soc < 0) soc = 0;
+    if (soc > 100) soc = 100;
+
+    int x = 60;      // centered for 320px width
+    int y = 5;
+    int w = 200;
+    int h = 30;
+
+    topBar.drawRect(x, y, w, h, TFT_WHITE);
+    topBar.fillRect(x + w, y + h/3, 10, h/3, TFT_WHITE);
+
+    int fillW = (int)((soc / 100.0f) * (w - 4));
+
+    uint16_t color = TFT_GREEN;
+    if (soc < 30) color = TFT_RED;
+    else if (soc < 60) color = TFT_YELLOW;
+
+    topBar.fillRect(x + 2, y + 2, fillW, h - 4, color);
+
+    topBar.setTextColor(TFT_WHITE, TFT_BLACK);
+    topBar.setTextSize(2);
+    topBar.setCursor(x + w + 15, y + 5);
+    topBar.printf("%.0f%%", soc);
+}
+
+/***************************************************************
+   SECTION 9 — SMALLER ANIMATED ARROWS (TOP BAR SPRITE)
+***************************************************************/
+void drawArrows(float current) {
+    arrowPhase = (arrowPhase + 1) % 12;
+
+    bool charging    = (current > 0.5f);
+    bool discharging = (current < -0.5f);
+
+    uint16_t arrowColor = charging ? TFT_GREEN :
+                          discharging ? TFT_RED :
+                          TFT_DARKGREY;
+
+    topBar.setTextColor(arrowColor, TFT_BLACK);
+    topBar.setTextSize(1);
+    topBar.setCursor(10, 8);
+
+    if (charging)         topBar.print("CHG");
+    else if (discharging) topBar.print("DIS");
+    else                  topBar.print("IDLE");
+
+    int baseY = 25 + (arrowPhase % 3);
+
+    for (int i = 0; i < 5; i++) {
+        int ax = 10 + i * 55;   // spaced across 320px
+        int ay = baseY;
+
+        if (charging) {
+            topBar.drawLine(ax, ay, ax + 12, ay, arrowColor);
+            topBar.drawLine(ax + 12, ay, ax + 8, ay - 4, arrowColor);
+            topBar.drawLine(ax + 12, ay, ax + 8, ay + 4, arrowColor);
+        }
+        else if (discharging) {
+            topBar.drawLine(ax + 12, ay, ax, ay, arrowColor);
+            topBar.drawLine(ax, ay, ax + 4, ay - 4, arrowColor);
+            topBar.drawLine(ax, ay, ax + 4, ay + 4, arrowColor);
+        }
+        else {
+            topBar.fillCircle(ax + 6, ay, 2, arrowColor);
+        }
+    }
+}
+
+/***************************************************************
+   SECTION 10 — SMARTSHUNT PANEL (LEFT)
+***************************************************************/
+void drawSmartShuntPanel() {
+  int x = 0;
+  int y = 55;     // under top bar
+  int w = 160;
+  int h = 180;    // fits in 240px height
+
+  tft.drawRect(x, y, w, h, TFT_BLUE);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(x + 5, y + 5);
+  tft.print("SmartShunt");
+
+  if (!gShunt.valid) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(x + 5, y + 25);
+    tft.print("No data");
+    return;
+  }
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+
+  int lineY = y + 25;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("RSSI: %d dBm", gShunt.rssi);
+
+  lineY += 15;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("Vbat: %.2f V", gShunt.voltage);
+
+  lineY += 15;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("Ibat: %.2f A", gShunt.current);
+
+  lineY += 15;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("SOC : %.1f %%", gShunt.soc);
+}
+
+/***************************************************************
+   SECTION 11 — DC/DC PANEL (RIGHT)
+***************************************************************/
+void drawDcdcPanel() {
+  int x = 160;
+  int y = 55;
+  int w = 160;
+  int h = 180;
+
+  tft.drawRect(x, y, w, h, TFT_MAGENTA);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(x + 5, y + 5);
+  tft.print("DC/DC");
+
+  if (!gDcdc.valid) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(x + 5, y + 25);
+    tft.print("No data");
+    return;
+  }
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+
+  int lineY = y + 25;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("RSSI: %d dBm", gDcdc.rssi);
+
+  lineY += 15;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("Vin : %.2f V", gDcdc.inVoltage);
+
+  lineY += 15;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("Vout: %.2f V", gDcdc.outVoltage);
+
+  lineY += 15;
+  tft.setCursor(x + 5, lineY);
+  tft.printf("Iout: %.2f A", gDcdc.outCurrent);
+}
+
+/***************************************************************
+   SECTION 12 — FULL DASHBOARD REDRAW
+***************************************************************/
+void drawDashboard() {
+  tft.fillScreen(TFT_BLACK);
+
+  float soc     = gShunt.valid ? gShunt.soc     : 0.0f;
+  float current = gShunt.valid ? gShunt.current : 0.0f;
+
+  topBar.fillSprite(TFT_BLACK);
+  drawBatteryGauge(soc);
+  drawArrows(current);
+  topBar.pushSprite(0, 0);
+
+  drawSmartShuntPanel();
+  drawDcdcPanel();
+}
+
+/***************************************************************
+   SECTION 13 — SETUP
+***************************************************************/
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  tft.init();
+  tft.setRotation(1);   // LANDSCAPE for 240x320
+  tft.fillScreen(TFT_BLACK);
+
+  topBar.createSprite(320, 50);   // full width
+
+  BLEDevice::init("");
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(99);
+
+  drawDashboard();
+}
+
+/***************************************************************
+   SECTION 14 — LOOP
+***************************************************************/
+void loop() {
+  BLEScan* scan = BLEDevice::getScan();
+
+  scan->start(5, false);
+  scan->clearResults();
+
+  arrowPhase++;
+
+  drawDashboard();
+
+  delay(300);
+}
